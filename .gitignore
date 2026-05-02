@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+
+# Raw CelebAMask-HQ / CelebA-HQ data
+CelebA-HQ-img/
+CelebAMask-HQ-mask-anno/
+CelebA-HQ-to-CelebA-mapping.txt
+CelebAMask-HQ-attribute-anno.txt
+CelebAMask-HQ-pose-anno.txt
+
+# Generated processed datasets and packages
+processed_celebmaskhq*/
+processed_celebmaskhq/
+*.tar
+
+# Checkpoints and run outputs
+checkpoint-*/
+checkpoint_*/
+base_mode/
+smoke_latest/
+micro comparsion/
+
+# Local smoke/debug artifacts
+*_smoke_local*/
+*_preview_smoke_local*/
+*_resume_cache_smoke_local*/
+*_fast_resume_smoke_local*/
+processed_celebmaskhq_bghairface_eval_metric_*/
+
+# Keep numeric results/plots, but avoid face-derived qualitative sheets by default.
+results/**/qualitative_contact_sheets/
+
+# Session handoff files
+SESSION_HANDOFF*.md
+SESSION_HANDOFF*.txt
+NEXT_SESSION_PROMPT*.md
+

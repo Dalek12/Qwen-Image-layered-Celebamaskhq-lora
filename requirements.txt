@@ -1,0 +1,13 @@
+accelerate
+bitsandbytes
+diffusers
+matplotlib
+numpy
+peft
+Pillow
+protobuf
+safetensors
+sentencepiece
+torch
+torchvision
+transformers
