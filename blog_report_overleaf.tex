@@ -18,7 +18,7 @@
 
 \title{\textbf{Adapting Qwen-Image-Layered for Portrait Layer Decomposition}\\
 \large An Engineering and Modeling Study with CelebAMask-HQ}
-\author{Project Report}
+\author{Dalek12\\Project Report}
 \date{\today}
 
 \begin{document}
@@ -205,6 +205,16 @@ experiments were possible:
 
 This engineering work was not cosmetic. Without it, many failures looked like
 modeling failures but were actually stale-code, packaging, or resume issues.
+
+\paragraph{Repository scope.}
+The public repository contains the final BG/HAIR/FACE preprocessing, training,
+evaluation, and reporting pipeline, plus selected notebooks needed to reproduce
+the results discussed in this report. Earlier exploratory notebooks for the
+five-layer target, prompt ablations, stability reruns, and intermediate
+checkpoint comparisons were not included as primary artifacts because they were
+superseded by the final target representation and would make the repository less
+focused. Their conclusions are summarized in the experiment timeline and report
+text, while the submitted code emphasizes the reproducible final workflow.
 
 \section{Training Objective}
 
