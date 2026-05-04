@@ -1,0 +1,720 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{caption}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!50!black,
+    citecolor=blue!50!black,
+    urlcolor=blue!50!black
+}
+
+\title{\textbf{Adapting Qwen-Image-Layered for Portrait Layer Decomposition}\\
+\large An Engineering and Modeling Study with CelebAMask-HQ}
+\author{Project Report}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This project investigates whether \texttt{Qwen/Qwen-Image-Layered}, a model
+designed to decompose images into editable RGBA layers, can be adapted to a
+portrait-specific layer decomposition task using CelebAMask-HQ supervision. The
+target application is simple to state: given a portrait, produce a small number
+of semantically meaningful transparent layers that can be edited independently.
+In practice, this became a study of the gap between semantic segmentation targets
+and the native decomposition behavior of a pretrained layered image model. We
+built an end-to-end Colab pipeline for preprocessing, metadata recovery, sharded
+packaging, LoRA training, checkpoint comparison, and numeric evaluation. Stronger
+fine-tuning settings on the original five-layer target caused noisy or collapsed
+outputs. The later three-layer BG/HAIR/FACE formulation was more stable, even at
+200 steps, but still produced only small improvements over the base model. The
+final 32-sample evaluation shows a small macro IoU improvement from 0.2461 to
+0.2585 at checkpoint 200, driven mostly by the face layer, while layer-health
+diagnostics still show high overlap and frequent full-canvas layers. The main
+conclusion is that the engineering pipeline is reliable, but target representation
+and alpha separation remain the central modeling bottlenecks.
+\end{abstract}
+
+\section{Motivation}
+
+Layered image editing is attractive because it turns a flat image into editable
+objects. If hair, face, background, text, or other components are isolated in
+separate RGBA layers, then downstream edits such as recoloring, moving, deleting,
+or replacing content can be applied locally. \texttt{Qwen-Image-Layered} is built
+around this idea: it takes an input image and produces multiple RGBA layers rather
+than a single raster output \cite{qwenlayered}. Its official examples emphasize
+variable-layer decomposition and editable structure.
+
+Portraits are a natural domain for this idea. A simple portrait editor might want
+separate layers for background, hair, and face. CelebAMask-HQ provides pixel-level
+face parsing masks for 30,000 high-resolution celebrity face images, making it a
+reasonable source of supervision for such a task \cite{celebamaskhq}. The core
+question for this project was therefore:
+
+\begin{quote}
+\emph{Can we fine-tune Qwen-Image-Layered with LoRA so that it decomposes portraits
+into stable, editable, semantically meaningful RGBA layers?}
+\end{quote}
+
+The answer we found is mixed. The infrastructure can be made to work, and small
+numeric improvements are possible, but straightforward LoRA fine-tuning did not
+solve layer separation.
+
+\section{Dataset and Target Construction}
+
+\subsection{CelebAMask-HQ}
+
+CelebAMask-HQ contains 30,000 face images selected from CelebA-HQ, with manually
+annotated 512$\times$512 segmentation masks over facial components and accessories
+such as skin, hair, eyes, eyebrows, mouth, lips, glasses, earrings, neck, and
+clothing \cite{celebamaskhq}. This annotation structure makes it useful for face
+parsing and facial image manipulation, but it also creates an important modeling
+tension: segmentation masks are crisp semantic regions, while a generative layered
+model may prefer broader visual chunks with soft alpha boundaries.
+
+The raw dataset copy used in the project was not perfectly complete. Some image
+IDs and mask IDs did not align. The preprocessing pipeline was therefore changed
+to operate on the intersection of valid image IDs and valid mask IDs, recording
+missing files instead of failing. This turned incomplete local/Drive data into a
+usable training source.
+
+\subsection{Layer Export}
+
+The preprocessing pipeline exports each sample into:
+
+\begin{itemize}[leftmargin=*]
+    \item \texttt{layered\_composites/}: the input portrait composite,
+    \item \texttt{layered\_layers/<sample\_id>/}: target RGBA layers,
+    \item \texttt{metadata/layered\_samples.jsonl}: per-sample metadata.
+\end{itemize}
+
+For a source image $I(x,y)\in[0,1]^3$ and a binary mask $M_k(x,y)$ for target
+layer $k$, the exported target layer is represented as an RGBA image
+\begin{equation}
+L_k(x,y)=
+\left[
+I(x,y)\odot M_k(x,y),\;
+M_k(x,y)
+\right],
+\end{equation}
+where the RGB channels are premultiplied by the alpha mask. This premultiplication
+became important later because transparent regions should not carry arbitrary
+hidden RGB values.
+
+The first major target representation was a five-layer portrait scheme:
+\begin{equation}
+\mathcal{T}_5=
+\{\mathrm{BG},\mathrm{HAIR},\mathrm{FACE\_SKIN},\mathrm{EYES},\mathrm{MOUTH}\}.
+\end{equation}
+
+Later, after observing weak visual improvement, we switched to a broader
+three-layer scheme:
+\begin{equation}
+\mathcal{T}_3=
+\{\mathrm{BG},\mathrm{HAIR},\mathrm{FACE}\},
+\end{equation}
+where
+\begin{equation}
+M_{\mathrm{FACE}}
+=
+M_{\mathrm{FACE\_SKIN}}
+\lor
+M_{\mathrm{EYES}}
+\lor
+M_{\mathrm{MOUTH}}.
+\end{equation}
+The background mask was defined as the complement of the foreground portrait
+groups:
+\begin{equation}
+M_{\mathrm{BG}}
+=
+1-
+\left(M_{\mathrm{HAIR}}\lor M_{\mathrm{FACE}}\right).
+\end{equation}
+
+\section{Colab and Packaging Infrastructure}
+
+The project was run with a Drive-first Colab workflow. Raw data and processed
+datasets lived on Google Drive, while smaller packaged artifacts were copied to
+local \texttt{/content} storage for GPU training. This separation mattered because
+Drive-backed random I/O over many small image files was too slow and fragile for
+training.
+
+The main Drive layout was:
+
+\begin{verbatim}
+/content/drive/MyDrive/CelebMaskHQ_Colab/
+  repo/
+  raw/
+  processed/
+  runs/
+\end{verbatim}
+
+Preprocessing and packaging were handled in CPU notebooks. Training, checkpoint
+comparison, and inference evaluation were handled in GPU notebooks. We used a
+paid Colab runtime exposing a G4-class GPU. The runtime reported a Blackwell-class
+NVIDIA RTX PRO 6000 GPU with approximately 96 GB of VRAM; this matches Google
+Cloud's documentation for G4 instances with NVIDIA RTX PRO 6000 Blackwell Server
+Edition GPUs and 96 GB GPU memory per GPU \cite{googleg4}.
+
+Several pieces of infrastructure were needed before meaningful modeling
+experiments were possible:
+
+\begin{itemize}[leftmargin=*]
+    \item metadata recovery from partially processed datasets,
+    \item train/val sharded tar packaging,
+    \item separate held-out test evaluation packaging,
+    \item checkpoint save/resume logic with optimizer and scheduler state,
+    \item LoRA adapter reactivation after resume,
+    \item freshness checks to avoid stale Colab copies of Drive code.
+\end{itemize}
+
+This engineering work was not cosmetic. Without it, many failures looked like
+modeling failures but were actually stale-code, packaging, or resume issues.
+
+\section{Training Objective}
+
+\subsection{Base Flow-Matching Loss}
+
+The training script follows the Qwen layered pipeline's latent flow-matching
+style objective. Let $z_0$ be the VAE latent of the target layered RGBA tensor and
+let $\epsilon\sim\mathcal{N}(0,I)$ be Gaussian noise. For a sampled noise level
+$\sigma$, the noisy target latent is
+\begin{equation}
+z_\sigma = (1-\sigma)z_0 + \sigma \epsilon.
+\end{equation}
+
+The transformer receives the packed noisy target latents together with packed
+conditioning latents from the input portrait. Its prediction is trained against
+the velocity-like target
+\begin{equation}
+v^\star = \epsilon - z_0.
+\end{equation}
+
+Ignoring masking, the original loss has the form
+\begin{equation}
+\mathcal{L}_{\mathrm{base}}
+=
+\mathbb{E}_{b,j}
+\left[
+w(\sigma_b)
+\left(
+\hat{v}_{\theta,bj}-v^\star_{bj}
+\right)^2
+\right],
+\end{equation}
+where $b$ indexes batch elements, $j$ indexes latent positions/channels/layers,
+and $w(\sigma)$ is the scheduler/timestep weighting from the SD3-style training
+utility.
+
+\subsection{Why Plain MSE Was Problematic}
+
+The target layers are sparse RGBA images. A face-feature layer or mouth layer
+contains only a small visible region and a large transparent canvas. In early
+experiments, plain latent MSE could be dominated by transparent regions or by
+hidden RGB values in nominally transparent pixels. This was a plausible contributor
+to two observed problems:
+
+\begin{itemize}[leftmargin=*]
+    \item stronger LoRA settings drifted into structured noise,
+    \item weaker settings avoided collapse but barely changed the base model.
+\end{itemize}
+
+\subsection{Alpha-Aware Modification}
+
+Two alpha-aware changes were introduced. First, target RGB values were premultiplied
+by alpha before training export. Second, the loss was weighted by an approximate
+latent-space visibility map derived from the target alpha channel.
+
+Let $\alpha_k(x,y)$ be the target alpha mask for layer $k$. It is downsampled to
+the latent grid with max pooling:
+\begin{equation}
+\bar{\alpha}_{kj}
+=
+\operatorname{MaxPool}(\alpha_k)_j.
+\end{equation}
+
+The latent loss weight is then
+\begin{equation}
+A_{kj}
+=
+\left(0.05 + 0.95\bar{\alpha}_{kj}\right)V_{kj},
+\end{equation}
+where $V_{kj}$ is a valid-layer mask. The small floor of $0.05$ preserves a weak
+context signal for transparent regions while strongly emphasizing visible pixels.
+
+The training loss used in the code is therefore
+\begin{equation}
+\mathcal{L}_{\alpha}
+=
+\frac{1}{B}
+\sum_{b=1}^{B}
+\operatorname{mean}_{j}
+\left[
+w(\sigma_b)
+A_{bj}
+\left(
+\hat{v}_{\theta,bj}-v^\star_{bj}
+\right)^2
+\right].
+\end{equation}
+
+For logging, a normalized alpha-weighted MSE was also computed:
+\begin{equation}
+\operatorname{MSE}_{\alpha}
+=
+\frac{
+\sum_{b,j}
+A_{bj}
+\left(
+\hat{v}_{\theta,bj}-v^\star_{bj}
+\right)^2
+}{
+\max\left(\sum_{b,j}A_{bj},1\right)
+}.
+\end{equation}
+
+This modification improved stability, but it did not fully solve layer separation.
+
+\section{Experiment Timeline}
+
+\subsection{Large 5-Layer Train/Val Run}
+
+The first major run used the five-layer target scheme with relatively strong LoRA
+settings:
+
+\begin{itemize}[leftmargin=*]
+    \item learning rate $10^{-4}$,
+    \item LoRA rank 16,
+    \item LoRA alpha 16,
+    \item gradient accumulation 8,
+    \item 2000 training steps,
+    \item checkpoints every 200 steps.
+\end{itemize}
+
+The loss curve looked plausible, and validation initially suggested a useful
+checkpoint around step 1200. However, held-out qualitative comparison showed badly
+degraded outputs with colorful structured noise. This was the first major lesson:
+numeric training curves alone were not enough. The trained LoRA had damaged the
+base model's useful decomposition behavior.
+
+\subsection{Stability Rerun}
+
+The next run reduced the learning rate and step count:
+
+\begin{itemize}[leftmargin=*]
+    \item learning rate $5\times10^{-5}$,
+    \item LoRA rank 16,
+    \item LoRA alpha 16,
+    \item gradient accumulation 4,
+    \item 800 steps,
+    \item checkpoints every 100 steps.
+\end{itemize}
+
+The best validation checkpoint appeared much earlier, around step 200. Later
+checkpoints generally worsened. The outputs were less catastrophically noisy than
+the 2000-step run but still did not beat the base model convincingly.
+
+\subsection{Weak Micro-Ablation}
+
+To test whether the model needed only a very small update, we used:
+
+\begin{itemize}[leftmargin=*]
+    \item learning rate $10^{-5}$,
+    \item LoRA rank 8,
+    \item LoRA alpha 8,
+    \item gradient accumulation 4,
+    \item 100 steps,
+    \item checkpoints every 25 steps.
+\end{itemize}
+
+This avoided collapse, but the outputs were visually close to the base model.
+The adaptation was stable but nearly a no-op.
+
+\subsection{Alpha-Weighted Micro-Ablation}
+
+The alpha-aware changes were then added to the weak micro-ablation recipe. This
+substantially improved the stability of the loss and helped avoid transparent-layer
+pathologies. However, the visual outcome remained modest: the LoRA changed outputs
+slightly but did not create reliably cleaner portrait layers.
+
+\subsection{Target Representation Change: BG/HAIR/FACE}
+
+The next hypothesis was that the five-layer target was too fine-grained and too
+segmentation-like. The broader target representation was:
+
+\begin{equation}
+\mathrm{BG}/\mathrm{HAIR}/\mathrm{FACE}.
+\end{equation}
+
+This used a 5k processed subset to reduce preprocessing overhead and keep the
+experiment focused on LoRA testing. The stable alpha-aware micro-ablation recipe
+was reused:
+
+\begin{itemize}[leftmargin=*]
+    \item learning rate $10^{-5}$,
+    \item rank 8,
+    \item LoRA alpha 8,
+    \item gradient accumulation 4,
+    \item 100 steps,
+    \item validation/checkpoint every 25 steps.
+\end{itemize}
+
+The best validation result was at step 50:
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+checkpoint & validation loss & note \\
+\midrule
+step 50 & 0.5089 & best checkpoint \\
+step 75 & 0.8571 & worse \\
+step 100 & 0.9682 & worse \\
+step 25 & 1.1364 & worse \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Qualitatively, checkpoint 50 gave partial improvement on some samples, especially
+by making one layer more hair-like or face-like, but the decomposition was still
+not clean. The background layer often remained nearly full-canvas, and the face
+layer frequently carried too much of the full portrait.
+
+\subsection{Prompt Experiments}
+
+We tested explicit layer-control prompts such as:
+
+\begin{quote}
+\texttt{decompose this portrait into exactly three editable RGBA layers: background, hair, and face}
+\end{quote}
+
+This hurt both the base model and the LoRA in qualitative comparisons. Later
+inference-only prompt ablations found that the best behavior came from the
+default call: no explicit prompt passed, with the pipeline's default English prompt
+behavior enabled. Descriptive prompts such as ``a close-up portrait photo of a
+person with visible face and hair'' often reduced layer quality or collapsed slots.
+
+\subsection{Low-Learning-Rate Continuation}
+
+We also tried continuing from checkpoint 50 with a lower learning rate and linear
+decay. The goal was to refine the partially useful checkpoint without drifting.
+Instead, validation became unstable:
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+checkpoint & validation loss & note \\
+\midrule
+step 55 & 0.5566 & best continuation checkpoint \\
+step 60 & 1.2446 & worse \\
+step 65 & 1.5236 & worse \\
+step 70 & 3.2514 & severe drift \\
+step 75 & 7.4991 & collapse-like behavior \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+This reinforced the conclusion that simply training longer was not the right path.
+
+\subsection{Three-Layer 200-Step Probe}
+
+Because the earlier noisy failures came from the stronger five-layer setup, we
+also tested whether the newer three-layer BG/HAIR/FACE representation would remain
+stable at 200 steps. This run used the same 5k processed subset and the same
+alpha-aware settings as the 100-step BG/HAIR/FACE run, but extended the maximum
+step count to 200.
+
+Unlike the old five-layer 2000-step run, the three-layer 200-step probe did not
+collapse into colorful noise. However, it also did not produce a decisive
+separation improvement. Its validation loss was still best around step 50:
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+validation step & validation loss & nearest saved checkpoint \\
+\midrule
+50 & 0.5087 & checkpoint 75 in the 200-step probe \\
+75 & 0.8571 & checkpoint 75 \\
+100 & 0.9680 & checkpoint 100 \\
+200 & 0.7792 & checkpoint 200 \\
+25 & 1.1369 & checkpoint 75 in the 200-step probe \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The checkpoint numbering detail matters: the 200-step probe saved checkpoints
+starting at step 75 in that Colab run, so the original checkpoint-50 used in the
+final comparison came from the earlier 100-step BG/HAIR/FACE run. The comparison
+therefore evaluates base model vs. original checkpoint 50 vs. new checkpoint 200.
+
+\section{Evaluation Metrics}
+
+The final numeric evaluation compared the base model, the BG/HAIR/FACE
+checkpoint-50 LoRA, and the BG/HAIR/FACE checkpoint-200 probe on 32 held-out test
+samples using the default-call inference setting.
+
+For a predicted binary alpha mask $\hat{M}_k$ and target mask $M_k$, we used:
+
+\begin{equation}
+\operatorname{IoU}_k
+=
+\frac{
+|\hat{M}_k\cap M_k|
+}{
+|\hat{M}_k\cup M_k|
+},
+\end{equation}
+
+\begin{equation}
+\operatorname{Dice}_k
+=
+\frac{
+2|\hat{M}_k\cap M_k|
+}{
+|\hat{M}_k|+|M_k|
+}.
+\end{equation}
+
+To reduce threshold brittleness, we also used a soft alpha IoU:
+\begin{equation}
+\operatorname{SoftIoU}_k
+=
+\frac{
+\sum_j \min(\hat{\alpha}_{kj},\alpha_{kj})
+}{
+\sum_j \max(\hat{\alpha}_{kj},\alpha_{kj})
+}.
+\end{equation}
+
+Alpha MAE was:
+\begin{equation}
+\operatorname{MAE}_{\alpha,k}
+=
+\frac{1}{N}
+\sum_j
+|\hat{\alpha}_{kj}-\alpha_{kj}|.
+\end{equation}
+
+We also tracked layer-health diagnostics:
+
+\begin{itemize}[leftmargin=*]
+    \item empty-layer rate,
+    \item full-layer rate,
+    \item multi-layer alpha overlap,
+    \item composite reconstruction MAE/PSNR.
+\end{itemize}
+
+The composite reconstruction metrics are only secondary. A model can reconstruct
+the input well by putting most of the image into every layer, so reconstruction
+quality does not imply editable separation.
+
+\section{Final Results}
+
+\begin{table}[h]
+\centering
+\caption{32-sample held-out evaluation. Higher IoU is better; lower alpha MAE is better.}
+\begin{tabular}{lrrrrrr}
+\toprule
+model & macro IoU & soft IoU & alpha MAE & BG IoU & HAIR IoU & FACE IoU \\
+\midrule
+base model & 0.2461 & 0.2469 & 0.5461 & 0.3229 & 0.1607 & 0.2547 \\
+checkpoint-50 LoRA & 0.2547 & 0.2554 & 0.5425 & 0.3229 & 0.1610 & 0.2800 \\
+checkpoint-200 LoRA & 0.2585 & 0.2592 & 0.5512 & 0.3229 & 0.1578 & 0.2947 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Layer-health diagnostics. Lower is generally better for these quantities.}
+\begin{tabular}{lrrr}
+\toprule
+model & empty-layer rate & full-layer rate & multi-layer overlap \\
+\midrule
+base model & 0.1458 & 0.5208 & 0.8108 \\
+checkpoint-50 LoRA & 0.1563 & 0.5313 & 0.8224 \\
+checkpoint-200 LoRA & 0.1250 & 0.5313 & 0.8530 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The LoRA improves macro IoU only modestly. Checkpoint 50 improves macro IoU by
+0.0085 absolute, and checkpoint 200 improves it by 0.0123 absolute relative to the
+base model. The gain is concentrated in the FACE layer: FACE IoU rises from
+0.2547 for the base model to 0.2800 at checkpoint 50 and 0.2947 at checkpoint 200.
+BG is essentially unchanged, and HAIR does not improve. Moreover, the layer-health
+diagnostics still show poor separation. Checkpoint 200 has the highest multi-layer
+overlap, 0.8530, meaning that the slight FACE IoU gain comes with worse layer
+separation.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{\detokenize{results/summary_metrics_200step.png}}
+\caption{Aggregate metrics for base model, checkpoint-50 LoRA, and checkpoint-200 LoRA.}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.75\linewidth]{\detokenize{results/per_layer_iou_200step.png}}
+\caption{Per-layer IoU. The main gain is concentrated in the FACE slot; HAIR remains weak.}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.75\linewidth]{\detokenize{results/layer_health_diagnostics_200step.png}}
+\caption{Layer-health diagnostics remain poor. The 200-step checkpoint does not reduce overlap; it increases the multi-layer overlap rate.}
+\end{figure}
+
+\subsection{Qualitative Showcase}
+
+The qualitative comparison uses the final three-way evaluation: base model,
+checkpoint 50 from the earlier BG/HAIR/FACE run, and checkpoint 200 from the
+200-step probe. This lets us show the updated conclusion directly: the latest
+three-layer setup does not collapse into obvious noise at 200 steps, but it still
+does not learn robust, clean portrait layer separation.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{\detokenize{results/contact_sheet_04337_200step.png}}
+\caption{A sample where the 200-step checkpoint improves the FACE slot relative to checkpoint 50. The output is not noisy, but separation is still imperfect: the FACE layer absorbs much of the portrait and the HAIR layer remains incomplete.}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{\detokenize{results/contact_sheet_00361_200step.png}}
+\caption{A sample where checkpoint 200 is worse than checkpoint 50. The longer-trained checkpoint does not become colorful noise, but it moves content into the wrong slots and reduces the macro IoU for this sample. This illustrates why 200 steps was not a reliable solution even though it remained visually stable.}
+\end{figure}
+
+Per-sample inspection showed that the mean gain was not broad. Some samples
+benefited from checkpoint 200, while others degraded relative to checkpoint 50.
+This makes the result a weak improvement in target-mask alignment rather than a
+robust model-quality win.
+
+\section{Failure Cases and Lessons}
+
+\subsection{More Steps Can Be Worse}
+
+The 2000-step five-layer run is the clearest noise-collapse failure case. Its loss
+curve did not obviously announce disaster, but visual comparison showed noisy,
+unusable layers. This should be understood as a failure of the earlier stronger
+five-layer setup, not as the behavior of the final three-layer setup. The newer
+BG/HAIR/FACE 200-step probe was visually more stable, but it still did not produce
+reliable separation and increased overlap. The practical lesson is therefore more
+specific: longer training did not monotonically improve decomposition quality,
+even when the target representation was simplified.
+
+\subsection{Validation Loss Did Not Fully Predict Editability}
+
+Validation loss was useful for rejecting some checkpoints, but it was not a
+complete proxy for visual layer quality. A checkpoint could have a better loss and
+still produce layers that were not meaningfully more editable than the base model.
+This motivated held-out visual comparison and eventually alpha-mask metrics.
+
+\subsection{Prompt Control Was Fragile}
+
+Explicit prompts that named the target layers seemed intuitive, but they worsened
+the decomposition. The base model behaved best when allowed to use its default
+prompting behavior. This suggests that Qwen-Image-Layered's prompt interface is
+not a simple semantic slot controller for this portrait task.
+
+\subsection{Semantic Segmentation Is Not the Same as Layer Decomposition}
+
+CelebAMask-HQ supervision is semantic and crisp. Layer decomposition for editing
+may be softer, broader, and more object-centric. A model trained for inherent
+editability may not naturally organize a face image into the same masks used by a
+face parsing benchmark.
+
+\section{Future Directions}
+
+The next stage should not simply train the same setup longer. More promising
+directions are:
+
+\paragraph{Explicit alpha and separation losses.}
+The most direct fix is to supervise alpha structure explicitly with Dice/BCE mask
+losses, overlap penalties, and full-canvas penalties for non-background layers.
+For example, an added overlap penalty could take the form
+\begin{equation}
+\mathcal{L}_{\mathrm{overlap}}
+=
+\sum_{k<\ell}
+\frac{1}{N}
+\sum_j
+\hat{\alpha}_{kj}\hat{\alpha}_{\ell j},
+\end{equation}
+penalizing multiple layers being opaque at the same pixel.
+
+\paragraph{Hybrid segmentation-guided cleanup.}
+A practical system could combine Qwen-Image-Layered with a face parsing or
+segmentation model. Qwen would provide generative layer content, while a portrait
+segmentation prior would clean the alpha masks. This would likely improve numeric
+separation quickly, but it would be a hybrid system rather than pure LoRA
+adaptation.
+
+\paragraph{More model-aligned target representations.}
+Instead of BG/HAIR/FACE, future targets could be broader:
+\[
+\mathrm{BG}/\mathrm{FULL\_SUBJECT}/\mathrm{HAIR\_DETAIL}
+\]
+or
+\[
+\mathrm{BG}/\mathrm{HEAD\_AND\_HAIR}/\mathrm{FACE\_FEATURES}.
+\]
+These may better match the pretrained model's native decomposition behavior.
+
+\paragraph{Cleaner curated supervision.}
+A smaller curated subset of frontal, minimally occluded portraits may reveal
+whether noisy or ambiguous masks are limiting learning. This would separate target
+noise from architectural or objective mismatch.
+
+\section{Conclusion}
+
+This project began as an attempt to fine-tune Qwen-Image-Layered into a portrait
+layer decomposition model. The final result is not a strong model-quality win, but
+it is a useful experimental finding. We built a working preprocessing, packaging,
+training, resume, comparison, and evaluation pipeline. We showed that aggressive
+LoRA training on the original five-layer target can damage the model, that weak
+alpha-aware LoRA training avoids that collapse, and that a broader BG/HAIR/FACE
+target remains stable but gives only small numeric gains.
+The remaining bottleneck is not basic engineering instability; it is the alignment
+between segmentation-derived supervision and the pretrained model's native layered
+representation.
+
+\begin{thebibliography}{9}
+
+\bibitem{qwenlayered}
+Qwen Team.
+\textit{Qwen-Image-Layered model card}.
+\url{https://huggingface.co/Qwen/Qwen-Image-Layered}.
+
+\bibitem{celebamaskhq}
+Cheng-Han Lee, Ziwei Liu, Lingyun Wu, and Ping Luo.
+\textit{CelebAMask-HQ Dataset}.
+\url{https://mmlab.ie.cuhk.edu.hk/projects/CelebA/CelebAMask_HQ.html}.
+
+\bibitem{maskgan}
+Cheng-Han Lee, Ziwei Liu, Lingyun Wu, and Ping Luo.
+\textit{MaskGAN: Towards Diverse and Interactive Facial Image Manipulation}.
+CVPR, 2020.
+
+\bibitem{googleg4}
+Google Cloud.
+\textit{Accelerator-optimized machine family: G4 machine series}.
+\url{https://cloud.google.com/compute/docs/accelerator-optimized-machines}.
+
+\bibitem{nvidiag4}
+NVIDIA.
+\textit{NVIDIA and Google Cloud Accelerate Enterprise AI and Industrial Digitalization}.
+\url{https://blogs.nvidia.com/blog/nvidia-google-cloud-enterprise-ai-industrial-digitalization/}.
+
+\end{thebibliography}
+
+\end{document}
