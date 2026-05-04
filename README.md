@@ -25,6 +25,17 @@ Summary from `results/qwen_layered_lora_bghairface_5k_default_call_32_metrics`:
 | base model | 0.2461 | 0.2469 | 0.5461 | 0.3229 | 0.1607 | 0.2547 |
 | checkpoint-50 LoRA | 0.2547 | 0.2554 | 0.5425 | 0.3229 | 0.1610 | 0.2800 |
 
+The final report also includes a 200-step BG/HAIR/FACE probe. Those outputs are
+stored in `results/qwen_layered_lora_bghairface_5k_200step_probe_default_call_32_metrics`.
+The 200-step checkpoint is stable, but the improvement is still small and layer
+overlap remains high:
+
+| model | macro IoU | soft alpha IoU | alpha MAE | BG IoU | HAIR IoU | FACE IoU |
+|---|---:|---:|---:|---:|---:|---:|
+| base model | 0.2461 | 0.2469 | 0.5461 | 0.3229 | 0.1607 | 0.2547 |
+| checkpoint-50 LoRA | 0.2547 | 0.2554 | 0.5425 | 0.3229 | 0.1610 | 0.2800 |
+| checkpoint-200 LoRA | 0.2585 | 0.2592 | 0.5512 | 0.3229 | 0.1578 | 0.2947 |
+
 Layer-health diagnostics still show high overlap and frequent full-canvas layers,
 so the conclusion is that target representation alone was not sufficient. Future
 work should focus on explicit alpha/separation losses, segmentation-guided cleanup,
@@ -39,6 +50,8 @@ or more model-aligned target layouts.
 - `notebooks/`: selected Colab notebooks for the reproducible BG/HAIR/FACE runs.
 - `results/`: small numeric metric outputs and aggregate plots.
 - `FUTURE_LAYER_SEPARATION_APPROACHES.md`: future-work notes.
+- `final_blog.pdf` and `blog_report_overleaf.tex`: final report artifact and
+  Overleaf source.
 
 ## Data Policy
 
@@ -103,9 +116,19 @@ Expected Google Drive layout in Colab:
    notebooks/CelebAMaskHQ_GPU_Evaluate_BG_HAIR_FACE_5K_Default_Call_32.ipynb
    ```
 
+8. To reproduce the 200-step probe used in the final report, run:
+
+   ```text
+   notebooks/CelebAMaskHQ_GPU_Training_BG_HAIR_FACE_5K_200Step_Probe.ipynb
+   notebooks/CelebAMaskHQ_GPU_Evaluate_BG_HAIR_FACE_5K_200Step_Probe_Default_Call_32.ipynb
+   ```
+
+The numeric CSV/JSON outputs and aggregate plots used in the report are included
+under `results/`. The report's qualitative contact sheets are included only for
+the two samples referenced by the LaTeX source.
+
 ## Notes
 
 The included numeric metrics should be interpreted as alignment to the
 CelebAMask-derived `BG / HAIR / FACE` target representation, not as a complete
 measure of human-perceived editability.
-
