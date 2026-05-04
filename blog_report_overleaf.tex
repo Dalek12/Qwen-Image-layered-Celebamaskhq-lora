@@ -166,6 +166,31 @@ NVIDIA RTX PRO 6000 GPU with approximately 96 GB of VRAM; this matches Google
 Cloud's documentation for G4 instances with NVIDIA RTX PRO 6000 Blackwell Server
 Edition GPUs and 96 GB GPU memory per GPU \cite{googleg4}.
 
+This runtime choice was also practical for Colab resource budgeting. In our
+Colab account, the G4 runtime used a substantially smaller compute-unit rate than
+the H100 option while still providing enough memory for Qwen-Image-Layered
+inference, LoRA training, and checkpoint comparison. The resource snapshots in
+Figure~\ref{fig:colab_usage} show the training and inference/evaluation contexts
+used for the final experiments.
+
+\begin{figure}[t]
+\centering
+\begin{minipage}{0.48\linewidth}
+\centering
+\includegraphics[width=\linewidth]{\detokenize{results/training_usage.png}}
+\small Training runtime
+\end{minipage}\hfill
+\begin{minipage}{0.48\linewidth}
+\centering
+\includegraphics[width=\linewidth]{\detokenize{results/inference_usage.png}}
+\small Inference/evaluation runtime
+\end{minipage}
+\caption{Colab resource snapshots for the G4-class runtime used in the
+GPU stages. The setup offered enough memory for the project while keeping the
+resource cost below the H100 runtime option available in Colab.}
+\label{fig:colab_usage}
+\end{figure}
+
 Several pieces of infrastructure were needed before meaningful modeling
 experiments were possible:
 
